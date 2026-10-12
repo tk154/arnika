@@ -78,17 +78,13 @@ const (
 // numbers for high-speed links. The 128-bit suites are rejected because the key
 // is 32 bytes.
 //
-// Nothing about the rotation is kept in memory, so both peers pick the same
-// association number (AN) for the same key even after a failed install or a
-// restart: the AN is derived from the key, skipping the AN the interface
-// currently encrypts with (read from the kernel). Each install keeps that SA
-// for frames still in flight, removes every other SA, and adds the new key as
-// TX and RX SA.
+// Coordinated QKD rotations choose AN = round modulo four, install RX before
+// notifying the peer, and commit TX after the receiving keys are ready. The
+// previous SA remains available for frames in flight. Numbered rounds keep AN
+// selection consistent after restarts and lost acknowledgements.
 //
-// TX switches to the new SA only switchDelay later. Both peers install the key
-// within milliseconds of each other, so by the time either side encrypts with
-// the new AN, the other can already decrypt it; switching immediately drops
-// the frames sent in between (InPktsNotUsingSA on the receiver).
+// Standalone SetPSK callers use a key-derived AN that skips the current TX slot
+// and a deferred switch; they require matching current slots on both peers.
 type Repository struct {
 	interfaceName string
 	rxSCI         uint64
@@ -97,6 +93,7 @@ type Repository struct {
 	mu        sync.Mutex
 	pending   *time.Timer // deferred encoding SA switch, nil if none
 	pendingAN uint8
+	stagedAN  *uint8               // installed for RX/TX, awaiting the peer's readiness
 	switchSA  func(an uint8) error // replaced in tests
 }
 
@@ -135,6 +132,7 @@ func (r *Repository) InvalidateTunnel() (err error) {
 		r.pending.Stop()
 		r.pending = nil
 	}
+	r.stagedAN = nil
 	s, closeSession, err := r.openSession()
 	if err != nil {
 		return err
@@ -158,15 +156,54 @@ func (r *Repository) InvalidateTunnel() (err error) {
 func (r *Repository) SetPSK(key []byte) (err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.stagePSKLocked(key, nil); err != nil {
+		return err
+	}
+	an := *r.stagedAN
+	r.stagedAN = nil
+	return r.scheduleSwitchLocked(an)
+}
+
+// StagePSK installs the receiving SA before the primary sends the key ID.
+// CommitPSK can then activate TX as soon as the peer acknowledges its install.
+func (r *Repository) StagePSK(key []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stagePSKLocked(key, nil)
+}
+
+// StagePSKForRound uses the authenticated shared round to choose the same AN
+// even when a missed acknowledgement left the peers on different TX SAs.
+func (r *Repository) StagePSKForRound(key []byte, round uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	an := uint8(round % macsecNumAN)
+	return r.stagePSKLocked(key, &an)
+}
+
+func (r *Repository) CommitPSK() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stagedAN == nil {
+		return errors.New("no MACsec key has been staged")
+	}
+	if err := r.switchSA(*r.stagedAN); err != nil {
+		return err
+	}
+	r.stagedAN = nil
+	return nil
+}
+
+func (r *Repository) stagePSKLocked(key []byte, roundAN *uint8) (err error) {
+	if len(key) != 32 {
+		return fmt.Errorf("PSK must be 32 bytes, got %d", len(key))
+	}
+	r.stagedAN = nil
 
 	// Apply a switch still pending from the previous key first: until it
 	// happens, TX encrypts with an SA this call is about to remove.
 	if err := r.flushPendingLocked(); err != nil {
 		return err
-	}
-
-	if len(key) != 32 {
-		return fmt.Errorf("PSK must be 32 bytes, got %d", len(key))
 	}
 
 	s, closeSession, err := r.openSession()
@@ -183,8 +220,11 @@ func (r *Repository) SetPSK(key []byte) (err error) {
 
 	current := s.link.encodingSA
 	next := macsecChooseAN(key, current)
+	if roundAN != nil {
+		next = *roundAN
+	}
 	for an := uint8(0); an < macsecNumAN; an++ {
-		if an == current {
+		if an == current && an != next {
 			continue
 		}
 		if err := s.retireTxSA(an); err != nil {
@@ -197,13 +237,14 @@ func (r *Repository) SetPSK(key []byte) (err error) {
 	if err := s.ensureRxSC(); err != nil {
 		return fmt.Errorf("failed to ensure RX SC: %w", err)
 	}
-	if err := s.addTxSA(next, sa); err != nil {
-		return fmt.Errorf("failed to add TX SA %d on %s: %w", next, r.interfaceName, err)
-	}
 	if err := s.addRxSA(next, sa); err != nil {
 		return fmt.Errorf("failed to add RX SA %d on %s: %w", next, r.interfaceName, err)
 	}
-	return r.scheduleSwitchLocked(next)
+	if err := s.addTxSA(next, sa); err != nil {
+		return fmt.Errorf("failed to add TX SA %d on %s: %w", next, r.interfaceName, err)
+	}
+	r.stagedAN = &next
+	return nil
 }
 
 // openSession resolves the interface and its MACsec settings and opens a

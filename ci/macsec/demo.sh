@@ -23,6 +23,7 @@ set -euo pipefail
 
 DURATION="${DURATION:-60}"      # iperf3 run time in seconds
 INTERVAL="${INTERVAL:-10s}"     # Arnika key rotation interval
+STARTUP_DELAY="${STARTUP_DELAY:-0}" # seconds between peer starts
 CIPHER="${CIPHER:-gcm-aes-256}" # gcm-aes-256 or gcm-aes-xpn-256 (64-bit packet numbers)
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ARNIKA="${ARNIKA:-$ROOT/build/arnika-macsec}"
@@ -87,6 +88,7 @@ start_node() { # start_node <ns> <id> <listen> <peer> <kms-ip> <sae> <rx-sci>
 }
 # ARNIKA_IDs must differ in parity, otherwise both nodes pick the same role.
 start_node $NS_A 9998 10.0.0.1 10.0.0.2 192.168.100.1 CONSB "$SCI_B"
+sleep "$STARTUP_DELAY"
 start_node $NS_B 9999 10.0.0.2 10.0.0.1 192.168.101.1 CONSA "$SCI_A"
 
 echo -n "Waiting for the first key"

@@ -23,6 +23,23 @@ func TestUsePQC(t *testing.T) {
 
 const testArnikaPSK = "0123456789abcdef0123456789abcdef0123456789ab"
 
+func TestParseRejectsNonpositiveRotationDurations(t *testing.T) {
+	for _, name := range []string{"INTERVAL", "KMS_RETRY_INTERVAL"} {
+		for _, duration := range []string{"0s", "-1s"} {
+			t.Run(name+"="+duration, func(t *testing.T) {
+				t.Setenv("LISTEN_ADDRESS", "127.0.0.1:9999")
+				t.Setenv("SERVER_ADDRESS", "127.0.0.1:9998")
+				t.Setenv("ARNIKA_PSK", testArnikaPSK)
+				t.Setenv("PQC_ENABLED", "false")
+				t.Setenv(name, duration)
+				if _, err := Parse(); err == nil || !strings.Contains(err.Error(), name) {
+					t.Fatalf("expected %s validation error, got %v", name, err)
+				}
+			})
+		}
+	}
+}
+
 func TestParse_ArnikaPSKValidation(t *testing.T) {
 	setValidEnv := func(t *testing.T) {
 		t.Helper()

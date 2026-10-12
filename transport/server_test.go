@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -301,7 +302,8 @@ func TestRunKeyIDWorkerAnswersAResendFromTheFirstOutcome(t *testing.T) {
 			done := make(chan bool)
 			defer close(done)
 			finished := make(chan struct{})
-			go RunKeyIDWorker(done, queue, func(keyID string) bool {
+			go RunKeyIDWorker(done, queue, func(req KeyIDRequest) bool {
+				keyID := req.KeyID
 				if keyID == "end" {
 					close(finished)
 					return false
@@ -385,6 +387,65 @@ func TestSendKeyIDIgnoresAnAckForAnotherKeyID(t *testing.T) {
 	}
 }
 
+func TestNumberedRequestAcknowledgesTheRoundAndKeyID(t *testing.T) {
+	p := startTestServer(t, nil)
+	payload := keyIDPayload(ClientConfig{Round: 1234, KeyID: "round-key"})
+	p.send(auth.PacketRotation, payload)
+	select {
+	case req := <-p.result:
+		if req.Round != 1234 || req.KeyID != "round-key" {
+			t.Fatalf("request = %+v", req)
+		}
+		req.Ack()
+	case <-time.After(time.Second):
+		t.Fatal("numbered request was not delivered")
+	}
+	if ack, ok := p.ackWithin(time.Second); !ok || !bytes.Equal([]byte(ack), payload) {
+		t.Fatal("ACK did not bind both round and key ID")
+	}
+}
+
+func TestSendKeyIDIgnoresAnAckForAnotherRound(t *testing.T) {
+	c := startFakePeer(t, func(_ int, payload string) (string, bool) {
+		wrong := []byte(payload)
+		binary.BigEndian.PutUint64(wrong[:8], 1233)
+		return string(wrong), true
+	})
+	c.Round = 1234
+	c.Deadline = time.Now().Add(200 * time.Millisecond)
+	if err := SendKeyID(c); err == nil {
+		t.Fatal("accepted ACK for a different round with the same key ID")
+	}
+}
+
+func TestNumberedResendRechecksInstallationDeadline(t *testing.T) {
+	queue := make(chan KeyIDRequest, 2)
+	done := make(chan bool)
+	defer close(done)
+	finished := make(chan struct{})
+	var calls, acks int
+	queue <- KeyIDRequest{KeyID: "key", Round: 42, Ack: func() { acks++ }}
+	queue <- KeyIDRequest{KeyID: "key", Round: 42, Ack: func() { acks++ }}
+	go func() {
+		RunKeyIDWorker(done, queue, func(KeyIDRequest) bool {
+			calls++
+			if calls == 2 {
+				close(finished)
+				return false
+			}
+			return true
+		})
+	}()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("resend bypassed deadline check")
+	}
+	if acks != 1 {
+		t.Fatalf("acks=%d, want 1", acks)
+	}
+}
+
 func TestSendKeyIDWaitsUntilTheDeadlineWithinTheDataPacketBudget(t *testing.T) {
 	var attempts atomic.Int64
 	c := startFakePeer(t, func(int, string) (string, bool) {
@@ -408,7 +469,7 @@ func TestSendKeyIDWaitsForASlowInstallWithoutReinstalling(t *testing.T) {
 	done := make(chan bool)
 	t.Cleanup(func() { close(done) })
 	var installs atomic.Int64
-	go RunKeyIDWorker(done, p.result, func(string) bool {
+	go RunKeyIDWorker(done, p.result, func(KeyIDRequest) bool {
 		installs.Add(1)
 		time.Sleep(700 * time.Millisecond)
 		return true
@@ -437,7 +498,8 @@ func TestRunQKDWorkerProcessesInReceiveOrder(t *testing.T) {
 	defer close(done)
 
 	seen := make(chan string, n)
-	go RunKeyIDWorker(done, queue, func(keyID string) bool {
+	go RunKeyIDWorker(done, queue, func(req KeyIDRequest) bool {
+		keyID := req.KeyID
 		seen <- keyID
 		return true
 	})
@@ -472,7 +534,7 @@ func TestRunQKDWorkerStopsOnShutdown(t *testing.T) {
 			exited := make(chan struct{})
 			go func() {
 				defer close(exited)
-				RunKeyIDWorker(done, queue, func(string) bool { return false })
+				RunKeyIDWorker(done, queue, func(KeyIDRequest) bool { return false })
 			}()
 
 			close(done)

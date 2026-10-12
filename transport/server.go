@@ -2,6 +2,8 @@
 package transport
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -22,8 +24,10 @@ const qkdQueueWarnEvery = 10 * time.Second
 type PQCHandler func(frame []byte, reply func(frame []byte) error) error
 
 // KeyIDRequest is one key id from the peer; call Ack only once its PSK is installed.
+// Round binds numbered requests to the rotation's shared deadline.
 type KeyIDRequest struct {
 	KeyID string
+	Round uint64 // zero for the legacy, unnumbered key-ID protocol
 	Ack   func()
 }
 
@@ -48,6 +52,7 @@ type ClientConfig struct {
 	DirOut       auth.Direction
 	DirIn        auth.Direction
 	KeyID        string
+	Round        uint64
 	Timeout      time.Duration
 	Deadline     time.Time
 	MaxClockSkew time.Duration
@@ -128,7 +133,7 @@ func Serve(c ServerConfig) error {
 		}
 
 		switch pkt.Type {
-		case auth.PacketData:
+		case auth.PacketData, auth.PacketRotation:
 			decrypted, err := auth.Decrypt(c.PSK, pkt.Payload)
 			if err != nil {
 				backupLog.Error("packet rejected, ARNIKA_PSK mismatch or the message is corrupted",
@@ -137,9 +142,18 @@ func Serve(c ServerConfig) error {
 			}
 
 			keyID := string(decrypted)
+			var round uint64
+			if pkt.Type == auth.PacketRotation {
+				if len(decrypted) <= 8 {
+					backupLog.Warn("rotation packet has no round or key_id", "peer", remoteAddr)
+					continue
+				}
+				round = binary.BigEndian.Uint64(decrypted[:8])
+				keyID = string(decrypted[8:])
+			}
 			select { // never block: a KMS outage in the worker would stall every PQC frame on this loop
-			case c.KeyIDs <- KeyIDRequest{KeyID: keyID, Ack: func() {
-				_ = send(auth.PacketAck, []byte(keyID), remoteAddr)
+			case c.KeyIDs <- KeyIDRequest{KeyID: keyID, Round: round, Ack: func() {
+				_ = send(auth.PacketAck, decrypted, remoteAddr)
 			}}:
 			default:
 				if queueFullWarn.allow() {
@@ -149,7 +163,7 @@ func Serve(c ServerConfig) error {
 				continue
 			}
 
-			backupLog.Info("received a key_id from the peer", "key_id", keyID, "peer", remoteAddr)
+			backupLog.Info("received a key_id from the peer", "key_id", keyID, "round", round, "peer", remoteAddr)
 
 		case auth.PacketPQC:
 			if c.PQC == nil {
@@ -188,6 +202,9 @@ func SendKeyID(c ClientConfig) error {
 	if c.Deadline.IsZero() {
 		return fmt.Errorf("c.Deadline is unset")
 	}
+	if !time.Now().Before(c.Deadline) {
+		return fmt.Errorf("rotation deadline has already passed")
+	}
 
 	raddr, err := net.ResolveUDPAddr("udp", c.Address)
 	if err != nil {
@@ -201,7 +218,7 @@ func SendKeyID(c ClientConfig) error {
 
 	wait := c.Timeout
 	for attempt := 1; attempt <= udpClientMaxAttempts; attempt++ {
-		encrypted, err := auth.Encrypt(c.PSK, []byte(c.KeyID))
+		encrypted, err := auth.Encrypt(c.PSK, keyIDPayload(c))
 		if err != nil {
 			return fmt.Errorf("failed to encrypt key_id: %w", err)
 		}
@@ -209,6 +226,9 @@ func SendKeyID(c ClientConfig) error {
 			Type:      auth.PacketData,
 			Timestamp: time.Now().Unix(),
 			Payload:   encrypted,
+		}
+		if c.Round != 0 {
+			dataPkt.Type = auth.PacketRotation
 		}
 		_, err = conn.Write(dataPkt.Marshal(c.PSK, c.DirOut))
 		if err != nil {
@@ -246,23 +266,34 @@ func awaitAck(conn *net.UDPConn, c ClientConfig, until time.Time) bool {
 			continue
 		}
 		keyID, err := auth.Decrypt(c.PSK, pkt.Payload)
-		if err == nil && string(keyID) == c.KeyID {
+		if err == nil && bytes.Equal(keyID, keyIDPayload(c)) {
 			return true
 		}
 	}
 }
 
+func keyIDPayload(c ClientConfig) []byte {
+	if c.Round == 0 {
+		return []byte(c.KeyID)
+	}
+	return append(binary.BigEndian.AppendUint64(nil, c.Round), c.KeyID...)
+}
+
 // RunKeyIDWorker must be the queue's only consumer, so PSKs are installed in the order the peer sent the key ids.
-func RunKeyIDWorker(done <-chan bool, queue <-chan KeyIDRequest, install func(keyID string) bool) {
+func RunKeyIDWorker(done <-chan bool, queue <-chan KeyIDRequest, install func(KeyIDRequest) bool) {
 	var last string
+	var lastRound uint64
 	var installed bool
 	for {
 		select {
 		case <-done:
 			return
 		case req := <-queue:
-			if req.KeyID != last {
-				last, installed = req.KeyID, install(req.KeyID)
+			// Numbered requests must recheck their deadline even on a resend.
+			// The rotation controller deduplicates successful installs without
+			// resetting packet numbers, and may retry a failed KMS lookup.
+			if req.Round != 0 || req.KeyID != last || req.Round != lastRound {
+				last, lastRound, installed = req.KeyID, req.Round, install(req)
 			}
 			if installed {
 				req.Ack()

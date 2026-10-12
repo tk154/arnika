@@ -219,6 +219,9 @@ func Parse() (*Config, error) {
 		return nil, fmt.Errorf("[ERROR] failed to parse INTERVAL: %w", err)
 	}
 	config.Interval = interval
+	if interval <= 0 {
+		return nil, fmt.Errorf("[ERROR] INTERVAL must be positive, got %s", interval)
+	}
 	// Optional here: only the WireGuard-family key writers need them, and they
 	// validate them in their wiring file (see RequireWireGuardPeer).
 	config.WireGuardInterface = getEnvOrDefault("WIREGUARD_INTERFACE", "")
@@ -270,6 +273,9 @@ func Parse() (*Config, error) {
 	config.KMSRetryInterval, err = time.ParseDuration(getEnvOrDefault("KMS_RETRY_INTERVAL", (config.Interval / 2).String()))
 	if err != nil {
 		return nil, fmt.Errorf("[ERROR] failed to parse KMS_RETRY_INTERVAL: %w", err)
+	}
+	if config.KMSRetryInterval <= 0 {
+		return nil, fmt.Errorf("[ERROR] KMS_RETRY_INTERVAL must be positive")
 	}
 	if !config.UsePQC() && config.IsPQCRequired() {
 		return nil, fmt.Errorf("[ERROR] PQC_ENABLED is false but MODE is %s, which requires a PQC key", config.Mode)

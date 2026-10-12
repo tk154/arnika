@@ -107,3 +107,21 @@ func TestInvalidateTunnelPrefersTheAdapterHook(t *testing.T) {
 		t.Errorf("got %d random-PSK writes, want none when the adapter invalidates itself", len(w.writes))
 	}
 }
+
+func TestNonStagedWriterWaitsForCommit(t *testing.T) {
+	w := &fakeWriter{}
+	s := NewKeyWriterService(w)
+	key := bytes.Repeat([]byte{5}, 32)
+	if err := s.StagePSKForRound(key, 42); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.writes) != 0 {
+		t.Fatal("WireGuard writer wrote before the peer acknowledgement")
+	}
+	if err := s.CommitPSK(key); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.writes) != 1 || !bytes.Equal(w.writes[0], key) {
+		t.Fatal("commit did not write the prepared PSK")
+	}
+}

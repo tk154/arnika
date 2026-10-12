@@ -19,6 +19,17 @@ type tunnelInvalidator interface {
 	InvalidateTunnel() error
 }
 
+// stagedKeyWriter lets MACsec prepare RX before the peer starts transmitting.
+// Other adapters retain the ACK-before-write behavior through CommitPSK.
+type stagedKeyWriter interface {
+	StagePSK(psk []byte) error
+	CommitPSK() error
+}
+
+type roundKeyWriter interface {
+	StagePSKForRound(psk []byte, round uint64) error
+}
+
 type KeyWriterService struct {
 	mu   sync.Mutex
 	repo keyWriterRepository
@@ -46,5 +57,35 @@ func (s *KeyWriterService) InvalidateTunnel() error {
 func (s *KeyWriterService) SetPSK(psk []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.repo.SetPSK(psk)
+}
+
+func (s *KeyWriterService) StagePSK(psk []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if staged, ok := s.repo.(stagedKeyWriter); ok {
+		return staged.StagePSK(psk)
+	}
+	return nil
+}
+
+func (s *KeyWriterService) StagePSKForRound(psk []byte, round uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if staged, ok := s.repo.(roundKeyWriter); ok {
+		return staged.StagePSKForRound(psk, round)
+	}
+	if staged, ok := s.repo.(stagedKeyWriter); ok {
+		return staged.StagePSK(psk)
+	}
+	return nil
+}
+
+func (s *KeyWriterService) CommitPSK(psk []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if staged, ok := s.repo.(stagedKeyWriter); ok {
+		return staged.CommitPSK()
+	}
 	return s.repo.SetPSK(psk)
 }

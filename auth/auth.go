@@ -20,9 +20,10 @@ var errAuth = errors.New("authentication failed") // one error for every failure
 type PacketType byte
 
 const (
-	PacketData PacketType = 'D'
-	PacketAck  PacketType = 'A'
-	PacketPQC  PacketType = 'Q' // the PQC frame kind lives inside the payload
+	PacketData     PacketType = 'D'
+	PacketAck      PacketType = 'A'
+	PacketPQC      PacketType = 'Q' // the PQC frame kind lives inside the payload
+	PacketRotation PacketType = 'R' // round (uint64, big-endian) followed by the QKD key ID
 )
 
 // Direction keys the HMAC per sending peer, so a packet reflected back to its sender fails verification.
